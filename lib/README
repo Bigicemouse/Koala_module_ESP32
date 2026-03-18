@@ -1,0 +1,26 @@
+本目录用于存放项目私有库（仅当前工程使用）。
+
+PlatformIO 会自动编译该目录下的库，并在链接阶段加入最终固件。
+
+建议结构如下：
+
+```text
+lib/
+  YourLibrary/
+    src/
+      YourLibrary.cpp
+      YourLibrary.h
+    library.json   （可选，用于自定义构建配置）
+```
+
+然后在 `src/main.cpp` 中直接引用：
+
+```cpp
+#include <YourLibrary.h>
+```
+
+只要源码中包含了对应头文件，PlatformIO 的库依赖查找机制会自动识别并链接依赖库。
+
+更多说明可参考：
+- 库配置：https://docs.platformio.org/page/librarymanager/config.html
+- 依赖查找：https://docs.platformio.org/page/librarymanager/ldf.html
