@@ -1,13 +1,8 @@
 /*
  * XAxisController
  *
- * 这是上层业务控制器，负责把“串口命令”和“运动执行”连接起来。
- *
- * 主要职责：
- * 1. 初始化 X 轴相关引脚和运动参数
- * 2. 解析串口命令，如 +N / -N / Sxxxx / Axxxx / STOP / HOME
- * 3. 维护 AUTO、手动、HOME 三类运行状态
- * 4. 调用 StepperMotion 库执行具体的步进脉冲输出
+ * 为了兼容既有工程名，对外仍保留 XAxisController 这个类名，
+ * 但内部实际上已经扩展成 X / Z 双轴可切换控制器。
  */
 
 #pragma once
@@ -18,14 +13,31 @@
 
 class XAxisController {
  public:
-  // 初始化控制器、串口、引脚和默认运动参数。
-  void begin();
+  enum class AxisId : uint8_t {
+    X = 0,
+    Z = 1,
+    Count,
+  };
 
-  // 主循环更新入口，每次 loop() 都应调用一次。
+  // 每根轴的静态硬件配置。
+  struct AxisConfig {
+    const __FlashStringHelper* name;
+    const __FlashStringHelper* driverName;
+    const __FlashStringHelper* microstepLabel;
+    uint8_t stepPin;
+    uint8_t dirPin;
+    uint8_t homeSwitchPin;
+    bool hasHomeSwitch;
+    bool forwardDirLevel;
+    bool reverseDirLevel;
+    uint32_t stepsPerRev;
+  };
+
+  void begin();
   void update();
 
  private:
-  // 当前运动所属场景，用于决定中断策略。
+  // 当前运动由谁发起，便于在中断时判断处理策略。
   enum class MotionOwner {
     None,
     Auto,
@@ -33,64 +45,86 @@ class XAxisController {
     Home,
   };
 
-  // 底层运动执行器，真正负责输出脉冲和速度曲线。
-  StepperMotion xAxisMotion_;
+  // 每根轴的运行时状态。
+  struct AxisRuntime {
+    StepperMotion motion;
+    float cruiseRateSps = 1000.0f;
+    float accelerationSps2 = 1800.0f;
+    int32_t pendingManualTurns = 0;
+    bool pendingHomeRequest = false;
+    bool stopRequested = false;
+    bool autoModeEnabled = true;
+    bool currentMoveStopsOnHomeSwitch = false;
+    bool homeKnown = false;
+    long currentPositionSteps = 0;
+    MotionOwner currentMotionOwner = MotionOwner::None;
+  };
 
-  // 串口接收缓冲区，支持逐字节拼装命令。
+  // 串口命令缓冲区。支持无换行输入，也支持带换行输入。
   char serialBuffer_[32] = {0};
   size_t serialBufferLength_ = 0;
   unsigned long lastSerialByteMs_ = 0;
 
-  // 当前生效的运行参数。
-  float cruiseRateSps_ = 1000.0f;
-  float accelerationSps2_ = 1800.0f;
+  // 轴切换采用“空闲后生效”的方式，避免强行打断底层状态。
+  AxisId activeAxis_ = AxisId::Z;
+  AxisId pendingAxis_ = AxisId::Z;
+  AxisId executingAxis_ = AxisId::Z;
+  bool axisSwitchPending_ = false;
+  AxisRuntime axisRuntime_[static_cast<size_t>(AxisId::Count)];
 
-  // 上层状态位。
-  int32_t pendingManualTurns_ = 0;
-  bool pendingHomeRequest_ = false;
-  bool stopRequested_ = false;
-  bool autoModeEnabled_ = true;
-  bool currentMoveStopsOnHomeSwitch_ = false;
-  bool homeKnown_ = false;
-
-  long currentPositionSteps_ = 0;
-  MotionOwner currentMotionOwner_ = MotionOwner::None;
-
-  // 由于底层运动库使用函数指针回调，这里保留当前活动实例用于桥接。
   static XAxisController* activeInstance_;
 
+  // 给 StepperMotion 的静态桥接回调。
   static bool shouldInterruptBridge();
+  static constexpr size_t axisIndex(AxisId axis) {
+    return static_cast<size_t>(axis);
+  }
 
-  // 运动执行期的中断判定逻辑。
+  // 轴状态访问辅助函数。
+  AxisRuntime& runtimeFor(AxisId axis);
+  const AxisRuntime& runtimeFor(AxisId axis) const;
+  const AxisConfig& configFor(AxisId axis) const;
+  AxisRuntime& activeRuntime();
+  const AxisRuntime& activeRuntime() const;
+  const AxisConfig& activeConfig() const;
+  const __FlashStringHelper* axisName(AxisId axis) const;
+  bool parseAxisCommand(const char* command, AxisId* axisOut) const;
+
+  // 中断、限位与服务逻辑。
   bool shouldInterruptCurrentMotion();
-  bool isHomeSwitchTriggered() const;
+  bool isHomeSwitchTriggered(AxisId axis) const;
   bool waitWithService(uint32_t durationMs, bool allowInterrupt);
-  bool runHomeApproach(uint32_t steps, float speedSps, const __FlashStringHelper* label);
-  bool runHomeBackoff(uint32_t steps, float speedSps, const __FlashStringHelper* label);
+  bool runHomeApproach(AxisId axis, uint32_t steps, float speedSps, const __FlashStringHelper* label);
+  bool runHomeBackoff(AxisId axis, uint32_t steps, float speedSps, const __FlashStringHelper* label);
+  void applyPendingAxisSwitchIfIdle();
 
-  void applyMotionProfile(float cruiseRate, float acceleration);
+  // 参数与状态输出。
+  void applyMotionProfile(AxisId axis, float cruiseRate, float acceleration);
   void printStartupBanner() const;
   void printSerialHelp() const;
   void printStatus() const;
 
-  // 串口处理链：接收字节 -> 组装命令 -> 解析命令。
+  // 串口输入处理。
   void pollSerial();
   void processBufferedSerialCommand();
   void handleSerialCommand(char* rawCommand);
 
-  // 外部命令对应的状态切换。
+  // 外部请求的动作入口。
   void queueManualMove(int32_t turns);
   void requestStop();
   void requestHome();
+  void requestAxisSwitch(AxisId axis);
   void clearStopIfIdle();
 
-  // 两类高层动作：手动运动和回零流程。
+  // 业务状态机。
   void performManualMoveIfPending();
   void performHomeSequenceIfPending();
+  void performAutoCycleIfEnabled();
 
-  // 运动结果回写与统一执行入口。
+  // 位置估算与底层运动执行。
   void updatePositionByDirection(uint32_t stepsExecuted, bool dirLevel);
-  StepperMoveReport executeMove(uint32_t steps,
+  StepperMoveReport executeMove(AxisId axis,
+                                uint32_t steps,
                                 bool dirLevel,
                                 MotionOwner owner,
                                 const __FlashStringHelper* label,

@@ -1,15 +1,15 @@
 /*
  * XAxisController.cpp
  *
- * 本文件实现上层控制逻辑：
- * - 管理串口命令
- * - 管理 AUTO / 手动 / HOME 状态机
- * - 调用 StepperMotion 执行实际运动
- *
- * 可以把它理解为“业务层控制器”，而不是直接驱动电机的底层模块。
+ * 当前实现负责：
+ * 1. 管理 X / Z 双轴的静态配置与运行时状态
+ * 2. 处理串口命令、AUTO 模式、手动转动、HOME 流程
+ * 3. 把具体步进执行委托给 StepperMotion
  */
 
 #include "XAxisController.h"
+
+#include <AxisProfile.h>
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -17,24 +17,29 @@
 
 namespace {
 
-// ---------------- 硬件映射 ----------------
 constexpr uint8_t EN_PIN = 12;
+constexpr bool ENABLE_ACTIVE_LEVEL = LOW;
+constexpr bool HOME_SWITCH_ACTIVE_LEVEL = LOW;
+
+// 当前项目采用“EN-GND 硬件常使能”方案，避免 GPIO12 影响 ESP32 启动。
+constexpr bool USE_SHARED_ENABLE_PIN = false;
+
 constexpr uint8_t X_STEP_PIN = 26;
 constexpr uint8_t X_DIR_PIN = 16;
 constexpr uint8_t X_HOME_SWITCH_PIN = 13;
 
-constexpr bool ENABLE_ACTIVE_LEVEL = LOW;
-constexpr bool HOME_SWITCH_ACTIVE_LEVEL = LOW;
+// 这套 ESP32 CNC Shield 上，Z 轴按当前实测接线使用 GPIO17 / GPIO14。
+constexpr uint8_t Z_STEP_PIN = 17;
+constexpr uint8_t Z_DIR_PIN = 14;
+constexpr uint8_t UNUSED_HOME_PIN = 0;
+
 constexpr bool FORWARD_DIR_LEVEL = HIGH;
 constexpr bool REVERSE_DIR_LEVEL = LOW;
-constexpr bool HOME_APPROACH_DIR_LEVEL = REVERSE_DIR_LEVEL;
-constexpr bool HOME_BACKOFF_DIR_LEVEL = FORWARD_DIR_LEVEL;
 
-// ---------------- 默认运动参数 ----------------
-constexpr uint32_t STEPS_PER_REV = 3200;
+constexpr uint32_t X_STEPS_PER_REV = AxisProfile::kXStepsPerRev;
+constexpr uint32_t Z_STEPS_PER_REV = AxisProfile::kZStepsPerRev;
+
 constexpr uint8_t DEFAULT_AUTO_TURNS = 3;
-constexpr uint32_t DEFAULT_AUTO_STEPS = STEPS_PER_REV * DEFAULT_AUTO_TURNS;
-
 constexpr uint16_t STEP_PULSE_HIGH_US = 10;
 constexpr uint16_t STARTUP_STABILIZE_MS = 1000;
 constexpr uint16_t MANUAL_COMMAND_PAUSE_MS = 1000;
@@ -43,9 +48,8 @@ constexpr uint16_t AUTO_PAUSE_AFTER_REVERSE_MS = 1000;
 constexpr uint16_t IDLE_SERVICE_DELAY_MS = 10;
 constexpr uint16_t SERIAL_COMMAND_IDLE_TIMEOUT_MS = 30;
 
-// ---------------- 速度、加速度、Jerk 限幅 ----------------
-constexpr float DEFAULT_CRUISE_RATE_SPS = 1000.0f;
-constexpr float DEFAULT_ACCELERATION_SPS2 = 1800.0f;
+constexpr float X_DEFAULT_CRUISE_RATE_SPS = AxisProfile::kXDefaultCruiseRateSps;
+constexpr float X_DEFAULT_ACCELERATION_SPS2 = AxisProfile::kXDefaultAccelerationSps2;
 constexpr float DEFAULT_JERK_RATIO = 12.0f;
 constexpr float MIN_START_RATE_SPS = 200.0f;
 constexpr float START_RATE_RATIO = 0.35f;
@@ -56,15 +60,24 @@ constexpr float MAX_ACCELERATION_SPS2 = 50000.0f;
 constexpr float MIN_JERK_SPS3 = 500.0f;
 constexpr float MAX_JERK_SPS3 = 500000.0f;
 
-// ---------------- HOME 相关参数 ----------------
 constexpr float HOME_SEEK_RATE_SPS = 400.0f;
 constexpr float HOME_LATCH_RATE_SPS = 200.0f;
 constexpr float HOME_ACCELERATION_SPS2 = 800.0f;
-constexpr uint32_t HOME_SEEK_MAX_STEPS = STEPS_PER_REV * 20;
+constexpr uint32_t HOME_SEEK_MAX_TURNS = 20;
 constexpr uint32_t HOME_BACKOFF_STEPS = 200;
 constexpr uint32_t HOME_LATCH_MAX_STEPS = 400;
 
-// 通用浮点限幅工具，用于保护串口调参输入。
+constexpr XAxisController::AxisConfig kAxisConfig[] = {
+    {F("X"), F("A4988"), F("1/16"), X_STEP_PIN, X_DIR_PIN, X_HOME_SWITCH_PIN, true,
+     FORWARD_DIR_LEVEL, REVERSE_DIR_LEVEL, X_STEPS_PER_REV},
+    {F("Z"), F("TMC2209"), F("1/16 (effective)"), Z_STEP_PIN, Z_DIR_PIN, UNUSED_HOME_PIN, false,
+     FORWARD_DIR_LEVEL, REVERSE_DIR_LEVEL, Z_STEPS_PER_REV},
+};
+
+static_assert(sizeof(kAxisConfig) / sizeof(kAxisConfig[0]) ==
+                  static_cast<size_t>(XAxisController::AxisId::Count),
+              "Axis config count mismatch");
+
 float clampFloat(float value, float minValue, float maxValue) {
   if (value < minValue) {
     return minValue;
@@ -75,7 +88,6 @@ float clampFloat(float value, float minValue, float maxValue) {
   return value;
 }
 
-// 根据巡航速度自动推导一个更柔和的起始速度。
 float computeStartRateSps(float cruiseRate) {
   const float derivedRate = cruiseRate * START_RATE_RATIO;
   if (derivedRate < MIN_START_RATE_SPS) {
@@ -84,7 +96,33 @@ float computeStartRateSps(float cruiseRate) {
   return min(cruiseRate, derivedRate);
 }
 
-// 去掉命令头尾空白，方便串口命令更宽容地匹配。
+// Z 轴默认速度按照每圈脉冲数同比换算，保证换轴后的“圈速感受”更接近。
+float defaultCruiseRateSpsForAxis(XAxisController::AxisId axis) {
+  switch (axis) {
+    case XAxisController::AxisId::X:
+      return X_DEFAULT_CRUISE_RATE_SPS;
+    case XAxisController::AxisId::Z:
+      return X_DEFAULT_CRUISE_RATE_SPS *
+             (static_cast<float>(Z_STEPS_PER_REV) / static_cast<float>(X_STEPS_PER_REV));
+    case XAxisController::AxisId::Count:
+    default:
+      return X_DEFAULT_CRUISE_RATE_SPS;
+  }
+}
+
+float defaultAccelerationSps2ForAxis(XAxisController::AxisId axis) {
+  switch (axis) {
+    case XAxisController::AxisId::X:
+      return X_DEFAULT_ACCELERATION_SPS2;
+    case XAxisController::AxisId::Z:
+      return X_DEFAULT_ACCELERATION_SPS2 *
+             (static_cast<float>(Z_STEPS_PER_REV) / static_cast<float>(X_STEPS_PER_REV));
+    case XAxisController::AxisId::Count:
+    default:
+      return X_DEFAULT_ACCELERATION_SPS2;
+  }
+}
+
 void trimCommandInPlace(char* command) {
   size_t start = 0;
   while (command[start] != '\0' &&
@@ -104,14 +142,12 @@ void trimCommandInPlace(char* command) {
   }
 }
 
-// 串口命令统一转大写，避免大小写差异影响识别。
 void upperCaseAsciiInPlace(char* command) {
   for (size_t i = 0; command[i] != '\0'; ++i) {
     command[i] = static_cast<char>(toupper(static_cast<unsigned char>(command[i])));
   }
 }
 
-// 允许 "STOP"、'STOP' 这类带包裹引号的串口输入。
 void stripWrappingQuotesInPlace(char* command) {
   const size_t length = strlen(command);
   if (length < 2) {
@@ -131,7 +167,6 @@ void stripWrappingQuotesInPlace(char* command) {
   command[length - 2] = '\0';
 }
 
-// 解析 +N / -N 形式的圈数命令。
 bool parseSignedTurns(const char* command, int32_t* turnsOut) {
   if (command[0] != '+' && command[0] != '-') {
     return false;
@@ -151,7 +186,6 @@ bool parseSignedTurns(const char* command, int32_t* turnsOut) {
   return true;
 }
 
-// 解析 Sxxxx / Axxxx 这类前缀命令，并做数值范围保护。
 bool parsePositiveValueCommand(const char* command,
                                char prefix,
                                float minValue,
@@ -171,70 +205,104 @@ bool parsePositiveValueCommand(const char* command,
   return true;
 }
 
-}  // 匿名命名空间
+// 这些命令输入完整后就可以立即提交，不必等换行。
+bool shouldSubmitImmediately(const char* command) {
+  return strcmp(command, "STOP") == 0 || strcmp(command, "HOME") == 0 ||
+         strcmp(command, "STATUS") == 0 || strcmp(command, "HELP") == 0 ||
+         strcmp(command, "?") == 0 || strcmp(command, "AUTO ON") == 0 ||
+         strcmp(command, "AUTO OFF") == 0 || strcmp(command, "AXIS X") == 0 ||
+         strcmp(command, "AXIS Z") == 0 || strcmp(command, "AXIS?") == 0;
+}
+
+}  // namespace
 
 XAxisController* XAxisController::activeInstance_ = nullptr;
 
+XAxisController::AxisRuntime& XAxisController::runtimeFor(AxisId axis) {
+  return axisRuntime_[axisIndex(axis)];
+}
+
+const XAxisController::AxisRuntime& XAxisController::runtimeFor(AxisId axis) const {
+  return axisRuntime_[axisIndex(axis)];
+}
+
+const XAxisController::AxisConfig& XAxisController::configFor(AxisId axis) const {
+  return kAxisConfig[axisIndex(axis)];
+}
+
+XAxisController::AxisRuntime& XAxisController::activeRuntime() {
+  return runtimeFor(activeAxis_);
+}
+
+const XAxisController::AxisRuntime& XAxisController::activeRuntime() const {
+  return runtimeFor(activeAxis_);
+}
+
+const XAxisController::AxisConfig& XAxisController::activeConfig() const {
+  return configFor(activeAxis_);
+}
+
+const __FlashStringHelper* XAxisController::axisName(AxisId axis) const {
+  return configFor(axis).name;
+}
+
+bool XAxisController::parseAxisCommand(const char* command, AxisId* axisOut) const {
+  if (strcmp(command, "X") == 0) {
+    *axisOut = AxisId::X;
+    return true;
+  }
+
+  if (strcmp(command, "Z") == 0) {
+    *axisOut = AxisId::Z;
+    return true;
+  }
+
+  return false;
+}
+
 void XAxisController::begin() {
-  // 注册当前实例，便于底层回调反向访问控制器状态。
   activeInstance_ = this;
 
   Serial.begin(115200);
 
-  pinMode(EN_PIN, OUTPUT);
-  pinMode(X_HOME_SWITCH_PIN, INPUT_PULLUP);
-  digitalWrite(EN_PIN, ENABLE_ACTIVE_LEVEL);
+  if (USE_SHARED_ENABLE_PIN) {
+    pinMode(EN_PIN, OUTPUT);
+    digitalWrite(EN_PIN, ENABLE_ACTIVE_LEVEL);
+  }
 
-  xAxisMotion_.begin(X_STEP_PIN, X_DIR_PIN);
-  applyMotionProfile(DEFAULT_CRUISE_RATE_SPS, DEFAULT_ACCELERATION_SPS2);
+  for (size_t i = 0; i < axisIndex(AxisId::Count); ++i) {
+    const AxisId axis = static_cast<AxisId>(i);
+    const AxisConfig& config = configFor(axis);
+
+    runtimeFor(axis).motion.begin(config.stepPin, config.dirPin);
+    applyMotionProfile(axis,
+                       defaultCruiseRateSpsForAxis(axis),
+                       defaultAccelerationSps2ForAxis(axis));
+    runtimeFor(axis).autoModeEnabled = (axis == AxisId::Z);
+
+    if (config.hasHomeSwitch) {
+      pinMode(config.homeSwitchPin, INPUT_PULLUP);
+    }
+  }
 
   printStartupBanner();
   delay(STARTUP_STABILIZE_MS);
 }
 
 void XAxisController::update() {
-  // 控制循环的优先级顺序：
-  // 1. 先处理串口与停止状态
-  // 2. 再处理 HOME
-  // 3. 再处理手动命令
-  // 4. 最后才进入自动往返
   pollSerial();
   clearStopIfIdle();
+  applyPendingAxisSwitchIfIdle();
 
   performHomeSequenceIfPending();
   clearStopIfIdle();
+  applyPendingAxisSwitchIfIdle();
 
   performManualMoveIfPending();
   clearStopIfIdle();
+  applyPendingAxisSwitchIfIdle();
 
-  if (!autoModeEnabled_) {
-    delay(IDLE_SERVICE_DELAY_MS);
-    return;
-  }
-
-  if (executeMove(DEFAULT_AUTO_STEPS,
-                  FORWARD_DIR_LEVEL,
-                  MotionOwner::Auto,
-                  F("auto forward"),
-                  false)
-          .result == StepperMoveResult::SoftStopped) {
-    return;
-  }
-
-  if (!waitWithService(AUTO_PAUSE_AFTER_FORWARD_MS, true)) {
-    return;
-  }
-
-  if (executeMove(DEFAULT_AUTO_STEPS,
-                  REVERSE_DIR_LEVEL,
-                  MotionOwner::Auto,
-                  F("auto reverse"),
-                  false)
-          .result == StepperMoveResult::SoftStopped) {
-    return;
-  }
-
-  waitWithService(AUTO_PAUSE_AFTER_REVERSE_MS, true);
+  performAutoCycleIfEnabled();
 }
 
 bool XAxisController::shouldInterruptBridge() {
@@ -242,23 +310,24 @@ bool XAxisController::shouldInterruptBridge() {
 }
 
 bool XAxisController::shouldInterruptCurrentMotion() {
-  // 运动执行过程中会频繁调用这里，
-  // 用来判断当前动作是否需要被停止、打断或切换。
   pollSerial();
 
-  if (currentMoveStopsOnHomeSwitch_ && isHomeSwitchTriggered()) {
+  const AxisRuntime& runtime = runtimeFor(executingAxis_);
+
+  if (runtime.currentMoveStopsOnHomeSwitch && isHomeSwitchTriggered(executingAxis_)) {
     return true;
   }
 
-  if (stopRequested_) {
+  if (runtime.stopRequested || axisSwitchPending_) {
     return true;
   }
 
-  switch (currentMotionOwner_) {
+  switch (runtime.currentMotionOwner) {
     case MotionOwner::Auto:
-      return !autoModeEnabled_ || pendingManualTurns_ != 0 || pendingHomeRequest_;
+      return !runtime.autoModeEnabled || runtime.pendingManualTurns != 0 ||
+             runtime.pendingHomeRequest;
     case MotionOwner::Manual:
-      return pendingHomeRequest_;
+      return runtime.pendingHomeRequest;
     case MotionOwner::Home:
       return false;
     case MotionOwner::None:
@@ -267,20 +336,26 @@ bool XAxisController::shouldInterruptCurrentMotion() {
   }
 }
 
-bool XAxisController::isHomeSwitchTriggered() const {
-  return digitalRead(X_HOME_SWITCH_PIN) == HOME_SWITCH_ACTIVE_LEVEL;
+bool XAxisController::isHomeSwitchTriggered(AxisId axis) const {
+  const AxisConfig& config = configFor(axis);
+  if (!config.hasHomeSwitch) {
+    return false;
+  }
+
+  return digitalRead(config.homeSwitchPin) == HOME_SWITCH_ACTIVE_LEVEL;
 }
 
 bool XAxisController::waitWithService(uint32_t durationMs, bool allowInterrupt) {
-  // 等待期间依旧持续处理串口，这样停顿阶段也能响应命令。
   const unsigned long startMs = millis();
 
   while (millis() - startMs < durationMs) {
     pollSerial();
+    applyPendingAxisSwitchIfIdle();
 
+    const AxisRuntime& runtime = activeRuntime();
     if (allowInterrupt &&
-        (stopRequested_ || pendingHomeRequest_ || pendingManualTurns_ != 0 ||
-         !autoModeEnabled_)) {
+        (runtime.stopRequested || runtime.pendingHomeRequest || runtime.pendingManualTurns != 0 ||
+         !runtime.autoModeEnabled || axisSwitchPending_)) {
       return false;
     }
 
@@ -290,23 +365,24 @@ bool XAxisController::waitWithService(uint32_t durationMs, bool allowInterrupt) 
   return true;
 }
 
-bool XAxisController::runHomeApproach(uint32_t steps,
+bool XAxisController::runHomeApproach(AxisId axis,
+                                      uint32_t steps,
                                       float speedSps,
                                       const __FlashStringHelper* label) {
-  // HOME 探测阶段会临时切换为更保守的速度和加速度。
-  const float savedCruiseRate = cruiseRateSps_;
-  const float savedAcceleration = accelerationSps2_;
+  AxisRuntime& runtime = runtimeFor(axis);
+  const float savedCruiseRate = runtime.cruiseRateSps;
+  const float savedAcceleration = runtime.accelerationSps2;
 
-  applyMotionProfile(speedSps, HOME_ACCELERATION_SPS2);
+  applyMotionProfile(axis, speedSps, HOME_ACCELERATION_SPS2);
   const StepperMoveReport report =
-      executeMove(steps, HOME_APPROACH_DIR_LEVEL, MotionOwner::Home, label, true);
-  applyMotionProfile(savedCruiseRate, savedAcceleration);
+      executeMove(axis, steps, configFor(axis).reverseDirLevel, MotionOwner::Home, label, true);
+  applyMotionProfile(axis, savedCruiseRate, savedAcceleration);
 
-  if (report.result == StepperMoveResult::SoftStopped && isHomeSwitchTriggered()) {
+  if (report.result == StepperMoveResult::SoftStopped && isHomeSwitchTriggered(axis)) {
     return true;
   }
 
-  if (stopRequested_) {
+  if (runtime.stopRequested) {
     Serial.println(F("HOME sequence stopped by STOP command."));
   } else {
     Serial.println(F("HOME sequence failed to detect the limit switch."));
@@ -315,110 +391,162 @@ bool XAxisController::runHomeApproach(uint32_t steps,
   return false;
 }
 
-bool XAxisController::runHomeBackoff(uint32_t steps,
+bool XAxisController::runHomeBackoff(AxisId axis,
+                                     uint32_t steps,
                                      float speedSps,
                                      const __FlashStringHelper* label) {
-  // 回零释放阶段同样使用 HOME 专用运动参数，结束后恢复原配置。
-  const float savedCruiseRate = cruiseRateSps_;
-  const float savedAcceleration = accelerationSps2_;
+  AxisRuntime& runtime = runtimeFor(axis);
+  const float savedCruiseRate = runtime.cruiseRateSps;
+  const float savedAcceleration = runtime.accelerationSps2;
 
-  applyMotionProfile(speedSps, HOME_ACCELERATION_SPS2);
+  applyMotionProfile(axis, speedSps, HOME_ACCELERATION_SPS2);
   const StepperMoveReport report =
-      executeMove(steps, HOME_BACKOFF_DIR_LEVEL, MotionOwner::Home, label, false);
-  applyMotionProfile(savedCruiseRate, savedAcceleration);
+      executeMove(axis, steps, configFor(axis).forwardDirLevel, MotionOwner::Home, label, false);
+  applyMotionProfile(axis, savedCruiseRate, savedAcceleration);
 
-  return report.result == StepperMoveResult::Completed && !stopRequested_;
+  return report.result == StepperMoveResult::Completed && !runtime.stopRequested;
 }
 
-void XAxisController::applyMotionProfile(float cruiseRate, float acceleration) {
-  // 这里统一管理控制器与底层运动库的参数同步，
-  // jerk 则根据 acceleration 自动推导。
-  cruiseRateSps_ = clampFloat(cruiseRate, MIN_CRUISE_RATE_SPS, MAX_CRUISE_RATE_SPS);
-  accelerationSps2_ =
+void XAxisController::applyPendingAxisSwitchIfIdle() {
+  if (!axisSwitchPending_) {
+    return;
+  }
+
+  const AxisRuntime& runtime = runtimeFor(executingAxis_);
+  if (runtime.currentMotionOwner != MotionOwner::None) {
+    return;
+  }
+
+  activeAxis_ = pendingAxis_;
+  axisSwitchPending_ = false;
+  Serial.print(F("Active axis switched to "));
+  Serial.println(axisName(activeAxis_));
+}
+
+void XAxisController::applyMotionProfile(AxisId axis, float cruiseRate, float acceleration) {
+  AxisRuntime& runtime = runtimeFor(axis);
+
+  runtime.cruiseRateSps = clampFloat(cruiseRate, MIN_CRUISE_RATE_SPS, MAX_CRUISE_RATE_SPS);
+  runtime.accelerationSps2 =
       clampFloat(acceleration, MIN_ACCELERATION_SPS2, MAX_ACCELERATION_SPS2);
 
-  xAxisMotion_.setPulseHighUs(STEP_PULSE_HIGH_US);
-  xAxisMotion_.setCruiseRateSps(cruiseRateSps_);
-  xAxisMotion_.setStartRateSps(computeStartRateSps(cruiseRateSps_));
-  xAxisMotion_.setAccelerationSps2(accelerationSps2_);
-  xAxisMotion_.setJerkSps3(
-      clampFloat(accelerationSps2_ * DEFAULT_JERK_RATIO, MIN_JERK_SPS3, MAX_JERK_SPS3));
+  runtime.motion.setPulseHighUs(STEP_PULSE_HIGH_US);
+  runtime.motion.setCruiseRateSps(runtime.cruiseRateSps);
+  runtime.motion.setStartRateSps(computeStartRateSps(runtime.cruiseRateSps));
+  runtime.motion.setAccelerationSps2(runtime.accelerationSps2);
+  runtime.motion.setJerkSps3(clampFloat(runtime.accelerationSps2 * DEFAULT_JERK_RATIO,
+                                        MIN_JERK_SPS3,
+                                        MAX_JERK_SPS3));
 }
 
 void XAxisController::printStartupBanner() const {
-  // 上电时输出一次当前配置，便于确认接线、默认模式和运动参数。
-  Serial.println(F("=== ESP32 CNC Shield A4988 X-Axis Controller ==="));
-  Serial.println(F("Default mode: AUTO 3 rev forward + 3 rev reverse"));
-  Serial.println(F("Manual commands interrupt AUTO with soft stop"));
-  Serial.print(F("Pins: EN="));
-  Serial.print(EN_PIN);
-  Serial.print(F(", STEP="));
-  Serial.print(X_STEP_PIN);
-  Serial.print(F(", DIR="));
-  Serial.print(X_DIR_PIN);
-  Serial.print(F(", HOME_SW="));
-  Serial.println(X_HOME_SWITCH_PIN);
-  Serial.print(F("Steps per revolution: "));
-  Serial.println(STEPS_PER_REV);
-  Serial.print(F("Cruise speed: "));
-  Serial.print(cruiseRateSps_, 1);
-  Serial.println(F(" steps/s"));
-  Serial.print(F("Acceleration: "));
-  Serial.print(accelerationSps2_, 1);
-  Serial.println(F(" steps/s^2"));
-  Serial.print(F("Jerk: "));
-  Serial.print(xAxisMotion_.getJerkSps3(), 1);
-  Serial.println(F(" steps/s^3"));
-  Serial.print(F("Driver enabled level: "));
-  Serial.println(ENABLE_ACTIVE_LEVEL == LOW ? F("LOW") : F("HIGH"));
+  Serial.println(F("=== ESP32 X/Z Axis Controller ==="));
+  Serial.println(F("X axis: A4988 1/16 microstep"));
+  Serial.println(F("Z axis: TMC2209 1/16 effective microstep"));
+  Serial.print(F("Shared EN pin: "));
+  if (USE_SHARED_ENABLE_PIN) {
+    Serial.println(EN_PIN);
+  } else {
+    Serial.println(F("GPIO12 ignored by firmware"));
+    Serial.println(F("Recommended wiring: short EN to GND on CNC Shield"));
+  }
+
+  for (size_t i = 0; i < axisIndex(AxisId::Count); ++i) {
+    const AxisId axis = static_cast<AxisId>(i);
+    const AxisConfig& config = configFor(axis);
+    const AxisRuntime& runtime = runtimeFor(axis);
+
+    Serial.print(F("Axis "));
+    Serial.print(config.name);
+    Serial.print(F(": DRIVER="));
+    Serial.print(config.driverName);
+    Serial.print(F(", MICROSTEP="));
+    Serial.print(config.microstepLabel);
+    Serial.print(F(", STEP="));
+    Serial.print(config.stepPin);
+    Serial.print(F(", DIR="));
+    Serial.print(config.dirPin);
+    Serial.print(F(", STEPS/REV="));
+    Serial.println(config.stepsPerRev);
+    Serial.print(F("  Cruise="));
+    Serial.print(runtime.cruiseRateSps, 1);
+    Serial.print(F(" steps/s, Accel="));
+    Serial.print(runtime.accelerationSps2, 1);
+    Serial.println(F(" steps/s^2"));
+  }
+
+  Serial.print(F("Default active axis: "));
+  Serial.println(axisName(activeAxis_));
   printSerialHelp();
 }
 
 void XAxisController::printSerialHelp() const {
-  // 帮助文本集中放在这里，方便后续继续扩展串口协议。
   Serial.println(F("Serial commands:"));
-  Serial.println(F("  +N      -> stop auto, wait 1s, move forward N revolutions"));
-  Serial.println(F("  -N      -> stop auto, wait 1s, move reverse N revolutions"));
-  Serial.println(F("  Sxxxx   -> set cruise speed in steps/second"));
-  Serial.println(F("  Axxxx   -> set acceleration in steps/second^2"));
-  Serial.println(F("  STOP    -> soft stop current motion and disable AUTO"));
-  Serial.println(F("  HOME    -> run X-axis homing sequence and disable AUTO"));
-  Serial.println(F("  AUTO ON -> enable auto 3-rev round trip"));
-  Serial.println(F("  AUTO OFF-> disable auto mode"));
-  Serial.println(F("  STATUS  -> print runtime status"));
-  Serial.println(F("  HELP/?  -> print this help"));
+  Serial.println(F("  AXIS X   -> switch active axis to X"));
+  Serial.println(F("  AXIS Z   -> switch active axis to Z"));
+  Serial.println(F("  AXIS?    -> print current active axis"));
+  Serial.println(F("  +N       -> move active axis forward N turns"));
+  Serial.println(F("  -N       -> move active axis reverse N turns"));
+  Serial.println(F("  Sxxxx    -> set active axis cruise speed in steps/second"));
+  Serial.println(F("  Axxxx    -> set active axis acceleration in steps/second^2"));
+  Serial.println(F("  STOP     -> soft stop current active axis and disable AUTO"));
+  Serial.println(F("  HOME     -> run HOME on active axis if limit switch exists"));
+  Serial.println(F("  AUTO ON  -> enable active axis auto round trip"));
+  Serial.println(F("  AUTO OFF -> disable active axis auto mode"));
+  Serial.println(F("  STATUS   -> print runtime status"));
+  Serial.println(F("  HELP/?   -> print this help"));
 }
 
 void XAxisController::printStatus() const {
-  // 运行时状态快照，主要用于串口调试和参数确认。
   Serial.println(F("=== Status ==="));
-  Serial.print(F("AUTO mode: "));
-  Serial.println(autoModeEnabled_ ? F("ON") : F("OFF"));
-  Serial.print(F("Cruise speed: "));
-  Serial.print(cruiseRateSps_, 1);
-  Serial.println(F(" steps/s"));
-  Serial.print(F("Acceleration: "));
-  Serial.print(accelerationSps2_, 1);
-  Serial.println(F(" steps/s^2"));
-  Serial.print(F("Jerk: "));
-  Serial.print(xAxisMotion_.getJerkSps3(), 1);
-  Serial.println(F(" steps/s^3"));
-  Serial.print(F("Position estimate: "));
-  Serial.print(currentPositionSteps_);
-  Serial.println(F(" steps"));
-  Serial.print(F("Home known: "));
-  Serial.println(homeKnown_ ? F("YES") : F("NO"));
-  Serial.print(F("Home switch: "));
-  Serial.println(isHomeSwitchTriggered() ? F("TRIGGERED") : F("RELEASED"));
-  Serial.print(F("Pending manual turns: "));
-  Serial.println(pendingManualTurns_);
-  Serial.print(F("Pending HOME: "));
-  Serial.println(pendingHomeRequest_ ? F("YES") : F("NO"));
+  Serial.print(F("Active axis: "));
+  Serial.println(axisName(activeAxis_));
+
+  for (size_t i = 0; i < axisIndex(AxisId::Count); ++i) {
+    const AxisId axis = static_cast<AxisId>(i);
+    const AxisConfig& config = configFor(axis);
+    const AxisRuntime& runtime = runtimeFor(axis);
+
+    Serial.print(F("[Axis "));
+    Serial.print(config.name);
+    Serial.println(F("]"));
+    Serial.print(F("  Auto mode: "));
+    Serial.println(runtime.autoModeEnabled ? F("ON") : F("OFF"));
+    Serial.print(F("  Cruise speed: "));
+    Serial.print(runtime.cruiseRateSps, 1);
+    Serial.println(F(" steps/s"));
+    Serial.print(F("  Acceleration: "));
+    Serial.print(runtime.accelerationSps2, 1);
+    Serial.println(F(" steps/s^2"));
+    Serial.print(F("  Jerk: "));
+    Serial.print(runtime.motion.getJerkSps3(), 1);
+    Serial.println(F(" steps/s^3"));
+    Serial.print(F("  Position estimate: "));
+    Serial.print(runtime.currentPositionSteps);
+    Serial.println(F(" steps"));
+    Serial.print(F("  Steps per revolution: "));
+    Serial.println(config.stepsPerRev);
+    Serial.print(F("  Home known: "));
+    Serial.println(runtime.homeKnown ? F("YES") : F("NO"));
+    Serial.print(F("  Home switch: "));
+    if (config.hasHomeSwitch) {
+      Serial.println(isHomeSwitchTriggered(axis) ? F("TRIGGERED") : F("RELEASED"));
+    } else {
+      Serial.println(F("NOT CONFIGURED"));
+    }
+    Serial.print(F("  Pending manual turns: "));
+    Serial.println(runtime.pendingManualTurns);
+    Serial.print(F("  Pending HOME: "));
+    Serial.println(runtime.pendingHomeRequest ? F("YES") : F("NO"));
+  }
+
+  if (axisSwitchPending_) {
+    Serial.print(F("Pending axis switch: "));
+    Serial.println(axisName(pendingAxis_));
+  }
 }
 
 void XAxisController::pollSerial() {
-  // 串口按“逐字节接收 + 空闲超时提交命令”的方式工作，
-  // 这样即使发送端不带换行，也能尽量识别命令。
   while (Serial.available() > 0) {
     const char received = static_cast<char>(Serial.read());
 
@@ -429,7 +557,18 @@ void XAxisController::pollSerial() {
 
     if (serialBufferLength_ < sizeof(serialBuffer_) - 1) {
       serialBuffer_[serialBufferLength_++] = received;
+      serialBuffer_[serialBufferLength_] = '\0';
       lastSerialByteMs_ = millis();
+
+      char previewBuffer[sizeof(serialBuffer_)] = {0};
+      memcpy(previewBuffer, serialBuffer_, serialBufferLength_ + 1);
+      trimCommandInPlace(previewBuffer);
+      stripWrappingQuotesInPlace(previewBuffer);
+      trimCommandInPlace(previewBuffer);
+      upperCaseAsciiInPlace(previewBuffer);
+      if (shouldSubmitImmediately(previewBuffer)) {
+        processBufferedSerialCommand();
+      }
       continue;
     }
 
@@ -445,7 +584,6 @@ void XAxisController::pollSerial() {
 }
 
 void XAxisController::processBufferedSerialCommand() {
-  // 把已经收完整的一条命令交给解析器，并清空缓冲区准备下一条。
   if (serialBufferLength_ == 0) {
     return;
   }
@@ -457,7 +595,6 @@ void XAxisController::processBufferedSerialCommand() {
 }
 
 void XAxisController::handleSerialCommand(char* rawCommand) {
-  // 命令进入业务解析前，先做去空格、去引号、统一大小写。
   trimCommandInPlace(rawCommand);
   stripWrappingQuotesInPlace(rawCommand);
   trimCommandInPlace(rawCommand);
@@ -473,15 +610,31 @@ void XAxisController::handleSerialCommand(char* rawCommand) {
 
   upperCaseAsciiInPlace(rawCommand);
 
+  if (strcmp(rawCommand, "AXIS?") == 0) {
+    Serial.print(F("Active axis: "));
+    Serial.println(axisName(activeAxis_));
+    return;
+  }
+
+  if (strncmp(rawCommand, "AXIS ", 5) == 0) {
+    AxisId requestedAxis = activeAxis_;
+    if (parseAxisCommand(rawCommand + 5, &requestedAxis)) {
+      requestAxisSwitch(requestedAxis);
+      return;
+    }
+  }
+
   float parsedValue = 0.0f;
   if (parsePositiveValueCommand(rawCommand,
                                 'S',
                                 MIN_CRUISE_RATE_SPS,
                                 MAX_CRUISE_RATE_SPS,
                                 &parsedValue)) {
-    applyMotionProfile(parsedValue, accelerationSps2_);
-    Serial.print(F("Cruise speed updated: "));
-    Serial.print(cruiseRateSps_, 1);
+    applyMotionProfile(activeAxis_, parsedValue, activeRuntime().accelerationSps2);
+    Serial.print(F("Axis "));
+    Serial.print(axisName(activeAxis_));
+    Serial.print(F(" cruise speed updated: "));
+    Serial.print(activeRuntime().cruiseRateSps, 1);
     Serial.println(F(" steps/s"));
     return;
   }
@@ -491,9 +644,11 @@ void XAxisController::handleSerialCommand(char* rawCommand) {
                                 MIN_ACCELERATION_SPS2,
                                 MAX_ACCELERATION_SPS2,
                                 &parsedValue)) {
-    applyMotionProfile(cruiseRateSps_, parsedValue);
-    Serial.print(F("Acceleration updated: "));
-    Serial.print(accelerationSps2_, 1);
+    applyMotionProfile(activeAxis_, activeRuntime().cruiseRateSps, parsedValue);
+    Serial.print(F("Axis "));
+    Serial.print(axisName(activeAxis_));
+    Serial.print(F(" acceleration updated: "));
+    Serial.print(activeRuntime().accelerationSps2, 1);
     Serial.println(F(" steps/s^2"));
     return;
   }
@@ -509,15 +664,19 @@ void XAxisController::handleSerialCommand(char* rawCommand) {
   }
 
   if (strcmp(rawCommand, "AUTO ON") == 0) {
-    autoModeEnabled_ = true;
-    stopRequested_ = false;
-    Serial.println(F("AUTO mode enabled."));
+    activeRuntime().autoModeEnabled = true;
+    activeRuntime().stopRequested = false;
+    Serial.print(F("Axis "));
+    Serial.print(axisName(activeAxis_));
+    Serial.println(F(" AUTO mode enabled."));
     return;
   }
 
   if (strcmp(rawCommand, "AUTO OFF") == 0) {
-    autoModeEnabled_ = false;
-    Serial.println(F("AUTO mode disabled."));
+    activeRuntime().autoModeEnabled = false;
+    Serial.print(F("Axis "));
+    Serial.print(axisName(activeAxis_));
+    Serial.println(F(" AUTO mode disabled."));
     return;
   }
 
@@ -537,60 +696,105 @@ void XAxisController::handleSerialCommand(char* rawCommand) {
 }
 
 void XAxisController::queueManualMove(int32_t turns) {
-  // 手动命令采用“排队请求”的方式，让主循环统一调度执行。
-  pendingManualTurns_ = turns;
-  Serial.print(F("Queued manual move: "));
+  AxisRuntime& runtime = activeRuntime();
+  runtime.pendingManualTurns = turns;
+  runtime.autoModeEnabled = false;
+
+  Serial.print(F("Axis "));
+  Serial.print(axisName(activeAxis_));
+  Serial.print(F(" queued manual move: "));
   Serial.print(turns);
   Serial.println(F(" rev"));
 }
 
 void XAxisController::requestStop() {
-  // STOP 的语义是：请求软停止，并清理会导致后续继续运动的待处理动作。
-  stopRequested_ = true;
-  pendingManualTurns_ = 0;
-  pendingHomeRequest_ = false;
-  autoModeEnabled_ = false;
-  Serial.println(F("STOP requested: soft stopping current motion, AUTO OFF."));
+  AxisRuntime& runtime = activeRuntime();
+  runtime.stopRequested = true;
+  runtime.pendingManualTurns = 0;
+  runtime.pendingHomeRequest = false;
+  runtime.autoModeEnabled = false;
+
+  Serial.print(F("Axis "));
+  Serial.print(axisName(activeAxis_));
+  Serial.println(F(" STOP requested: soft stopping current motion, AUTO OFF."));
 }
 
 void XAxisController::requestHome() {
-  // HOME 会关闭自动模式，并在当前动作安全结束后进入回零流程。
-  pendingHomeRequest_ = true;
-  autoModeEnabled_ = false;
-  Serial.println(F("HOME requested: AUTO OFF, homing will run after current motion stops."));
+  const AxisConfig& config = activeConfig();
+  AxisRuntime& runtime = activeRuntime();
+
+  if (!config.hasHomeSwitch) {
+    Serial.print(F("Axis "));
+    Serial.print(config.name);
+    Serial.println(F(" HOME is unavailable because no limit switch pin is configured."));
+    return;
+  }
+
+  runtime.pendingHomeRequest = true;
+  runtime.autoModeEnabled = false;
+  Serial.print(F("Axis "));
+  Serial.print(config.name);
+  Serial.println(F(" HOME requested: AUTO OFF, homing will run after current motion stops."));
+}
+
+void XAxisController::requestAxisSwitch(AxisId axis) {
+  if (!axisSwitchPending_ && activeAxis_ == axis) {
+    Serial.print(F("Active axis is already "));
+    Serial.println(axisName(axis));
+    return;
+  }
+
+  pendingAxis_ = axis;
+  axisSwitchPending_ = true;
+  activeRuntime().autoModeEnabled = false;
+
+  Serial.print(F("Axis switch requested: "));
+  Serial.print(axisName(activeAxis_));
+  Serial.print(F(" -> "));
+  Serial.println(axisName(axis));
 }
 
 void XAxisController::clearStopIfIdle() {
-  // 软停止标志只在主循环重新回到空闲态后清掉，避免重复触发。
-  if (stopRequested_) {
-    stopRequested_ = false;
-    Serial.println(F("Soft stop completed. Controller is idle, AUTO OFF."));
+  for (size_t i = 0; i < axisIndex(AxisId::Count); ++i) {
+    AxisRuntime& runtime = runtimeFor(static_cast<AxisId>(i));
+    if (!runtime.stopRequested || runtime.currentMotionOwner != MotionOwner::None) {
+      continue;
+    }
+
+    runtime.stopRequested = false;
+    Serial.print(F("Axis "));
+    Serial.print(axisName(static_cast<AxisId>(i)));
+    Serial.println(F(" soft stop completed. Controller is idle, AUTO OFF."));
   }
 }
 
 void XAxisController::performManualMoveIfPending() {
-  // 手动动作会先等待 1 秒，给电机和用户一个明确的切换缓冲。
-  if (pendingManualTurns_ == 0) {
+  AxisRuntime& runtime = activeRuntime();
+  const AxisConfig& config = activeConfig();
+  if (runtime.pendingManualTurns == 0) {
     return;
   }
 
-  Serial.println(F("Preparing manual move, waiting 1 second before execution."));
+  Serial.print(F("Axis "));
+  Serial.print(config.name);
+  Serial.println(F(" preparing manual move, waiting 1 second before execution."));
   waitWithService(MANUAL_COMMAND_PAUSE_MS, false);
 
-  if (stopRequested_ || pendingHomeRequest_ || pendingManualTurns_ == 0) {
+  if (runtime.stopRequested || runtime.pendingHomeRequest || runtime.pendingManualTurns == 0 ||
+      axisSwitchPending_) {
     return;
   }
 
-  const int32_t turns = pendingManualTurns_;
-  pendingManualTurns_ = 0;
+  const int32_t turns = runtime.pendingManualTurns;
+  runtime.pendingManualTurns = 0;
 
-  const bool dirLevel = turns > 0 ? FORWARD_DIR_LEVEL : REVERSE_DIR_LEVEL;
-  const uint32_t steps = static_cast<uint32_t>(abs(turns)) * STEPS_PER_REV;
+  const bool dirLevel = turns > 0 ? config.forwardDirLevel : config.reverseDirLevel;
+  const uint32_t steps = static_cast<uint32_t>(abs(turns)) * config.stepsPerRev;
   const __FlashStringHelper* label =
       turns > 0 ? F("manual forward") : F("manual reverse");
 
   const StepperMoveReport report =
-      executeMove(steps, dirLevel, MotionOwner::Manual, label, false);
+      executeMove(activeAxis_, steps, dirLevel, MotionOwner::Manual, label, false);
 
   if (report.result == StepperMoveResult::SoftStopped) {
     Serial.println(F("Manual move was interrupted before the requested distance finished."));
@@ -598,73 +802,125 @@ void XAxisController::performManualMoveIfPending() {
 }
 
 void XAxisController::performHomeSequenceIfPending() {
-  // HOME 使用“快找 -> 退回 -> 慢靠”的二次靠近流程，提高可靠性。
-  if (!pendingHomeRequest_) {
+  AxisRuntime& runtime = activeRuntime();
+  const AxisConfig& config = activeConfig();
+  if (!runtime.pendingHomeRequest) {
     return;
   }
 
-  pendingHomeRequest_ = false;
-  Serial.println(F("=== HOME sequence start ==="));
+  runtime.pendingHomeRequest = false;
+  Serial.print(F("=== HOME sequence start on axis "));
+  Serial.print(config.name);
+  Serial.println(F(" ==="));
 
-  if (isHomeSwitchTriggered()) {
+  const uint32_t homeSeekMaxSteps = config.stepsPerRev * HOME_SEEK_MAX_TURNS;
+  if (isHomeSwitchTriggered(activeAxis_)) {
     Serial.println(F("Home switch is already active, backing off first."));
-    if (!runHomeBackoff(HOME_BACKOFF_STEPS, HOME_SEEK_RATE_SPS, F("home initial backoff"))) {
+    if (!runHomeBackoff(activeAxis_, HOME_BACKOFF_STEPS, HOME_SEEK_RATE_SPS,
+                        F("home initial backoff"))) {
       return;
     }
   }
 
-  if (!runHomeApproach(HOME_SEEK_MAX_STEPS, HOME_SEEK_RATE_SPS, F("home seek"))) {
+  if (!runHomeApproach(activeAxis_, homeSeekMaxSteps, HOME_SEEK_RATE_SPS, F("home seek"))) {
     return;
   }
 
-  if (!runHomeBackoff(HOME_BACKOFF_STEPS, HOME_SEEK_RATE_SPS, F("home release"))) {
+  if (!runHomeBackoff(activeAxis_, HOME_BACKOFF_STEPS, HOME_SEEK_RATE_SPS, F("home release"))) {
     return;
   }
 
-  if (!runHomeApproach(HOME_LATCH_MAX_STEPS, HOME_LATCH_RATE_SPS, F("home latch"))) {
+  if (!runHomeApproach(activeAxis_, HOME_LATCH_MAX_STEPS, HOME_LATCH_RATE_SPS, F("home latch"))) {
     return;
   }
 
-  currentPositionSteps_ = 0;
-  homeKnown_ = true;
-  Serial.println(F("HOME complete. Position reset to 0."));
+  runtime.currentPositionSteps = 0;
+  runtime.homeKnown = true;
+  Serial.print(F("Axis "));
+  Serial.print(config.name);
+  Serial.println(F(" HOME complete. Position reset to 0."));
+}
+
+void XAxisController::performAutoCycleIfEnabled() {
+  AxisRuntime& runtime = activeRuntime();
+  const AxisConfig& config = activeConfig();
+  if (!runtime.autoModeEnabled) {
+    delay(IDLE_SERVICE_DELAY_MS);
+    return;
+  }
+
+  const uint32_t autoSteps = config.stepsPerRev * DEFAULT_AUTO_TURNS;
+  if (executeMove(activeAxis_,
+                  autoSteps,
+                  config.forwardDirLevel,
+                  MotionOwner::Auto,
+                  F("auto forward"),
+                  false)
+          .result == StepperMoveResult::SoftStopped) {
+    return;
+  }
+
+  if (!waitWithService(AUTO_PAUSE_AFTER_FORWARD_MS, true)) {
+    return;
+  }
+
+  if (executeMove(activeAxis_,
+                  autoSteps,
+                  config.reverseDirLevel,
+                  MotionOwner::Auto,
+                  F("auto reverse"),
+                  false)
+          .result == StepperMoveResult::SoftStopped) {
+    return;
+  }
+
+  waitWithService(AUTO_PAUSE_AFTER_REVERSE_MS, true);
 }
 
 void XAxisController::updatePositionByDirection(uint32_t stepsExecuted, bool dirLevel) {
-  // 这里只维护一个“软件位置估计值”，用于串口状态显示和 HOME 后清零。
+  AxisRuntime& runtime = runtimeFor(executingAxis_);
+  const AxisConfig& config = configFor(executingAxis_);
   const long signedSteps = static_cast<long>(stepsExecuted);
-  if (dirLevel == FORWARD_DIR_LEVEL) {
-    currentPositionSteps_ += signedSteps;
+
+  if (dirLevel == config.forwardDirLevel) {
+    runtime.currentPositionSteps += signedSteps;
   } else {
-    currentPositionSteps_ -= signedSteps;
+    runtime.currentPositionSteps -= signedSteps;
   }
 }
 
-StepperMoveReport XAxisController::executeMove(uint32_t steps,
+StepperMoveReport XAxisController::executeMove(AxisId axis,
+                                               uint32_t steps,
                                                bool dirLevel,
                                                MotionOwner owner,
                                                const __FlashStringHelper* label,
                                                bool stopOnHomeSwitch) {
-  // 这里是统一运动入口：
-  // 1. 设置当前动作归属
-  // 2. 调用 StepperMotion 真正发脉冲
-  // 3. 回写执行结果与位置估计
-  currentMotionOwner_ = owner;
-  currentMoveStopsOnHomeSwitch_ = stopOnHomeSwitch;
+  AxisRuntime& runtime = runtimeFor(axis);
+  const AxisConfig& config = configFor(axis);
 
-  Serial.print(F("Motion start: "));
+  executingAxis_ = axis;
+  runtime.currentMotionOwner = owner;
+  runtime.currentMoveStopsOnHomeSwitch = stopOnHomeSwitch;
+
+  Serial.print(F("Axis "));
+  Serial.print(config.name);
+  Serial.print(F(" motion start: "));
   Serial.print(label);
   Serial.print(F(" | steps="));
-  Serial.println(steps);
+  Serial.print(steps);
+  Serial.print(F(" | dir="));
+  Serial.println(dirLevel == HIGH ? F("HIGH") : F("LOW"));
 
   const StepperMoveReport report =
-      xAxisMotion_.moveSteps(steps, dirLevel, shouldInterruptBridge);
+      runtime.motion.moveSteps(steps, dirLevel, shouldInterruptBridge);
 
-  currentMotionOwner_ = MotionOwner::None;
-  currentMoveStopsOnHomeSwitch_ = false;
+  runtime.currentMotionOwner = MotionOwner::None;
+  runtime.currentMoveStopsOnHomeSwitch = false;
   updatePositionByDirection(report.stepsExecuted, dirLevel);
 
-  Serial.print(F("Motion end: "));
+  Serial.print(F("Axis "));
+  Serial.print(config.name);
+  Serial.print(F(" motion end: "));
   Serial.print(label);
   Serial.print(F(" | executed="));
   Serial.print(report.stepsExecuted);
